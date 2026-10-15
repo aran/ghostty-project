@@ -1,0 +1,158 @@
+#!/bin/zsh
+# Ensure a Ghostty tab is running Claude Code for each session in a project.
+#
+#   ghostty-project <project>     ensure ~/.config/ghostty-projects/<project>
+#   ghostty-project               list projects
+#
+# Project file: one session per line, "name [dir] [extra claude args...]".
+# dir defaults to ~/Projects/<name>. Blank lines and # comments are ignored.
+# Sessions whose dir is missing are skipped with a warning (exit status 1).
+#
+# Safe to rerun. Each Ghostty tab is a login -> shell pair on its own tty;
+# the process table says what each one is doing (the tty's foreground
+# process group) and where (the shell's cwd). Per session:
+#   - Claude in the foreground of a tab in the dir: left alone
+#   - a tab in the dir idle at its shell prompt: Claude is started in it
+#   - otherwise: a new tab, in the window already holding the project's
+#     tabs, or a new window if none is open
+# Claude resumes the dir's latest conversation (--continue), or starts fresh.
+# Needs Ghostty 1.3+ (AppleScript).
+set -euo pipefail
+
+conf_dir=${GHOSTTY_PROJECTS_DIR:-$HOME/.config/ghostty-projects}
+
+if (( $# == 0 )); then
+  print -l -- $conf_dir/*(N:t)
+  exit 0
+fi
+
+file=$conf_dir/$1
+[[ -f $file ]] || { print -u2 "no project file: $file"; exit 1; }
+
+# --- What every Ghostty tab is doing, from the process table. ---
+typeset -A ppid_of pgid_of tpgid_of tty_of comm_of
+while read -r pid ppid pgid tpgid tty comm; do
+  ppid_of[$pid]=$ppid pgid_of[$pid]=$pgid tpgid_of[$pid]=$tpgid
+  tty_of[$pid]=$tty comm_of[$pid]=$comm
+done < <(ps -A -o pid=,ppid=,pgid=,tpgid=,tty=,comm=)
+
+typeset -A tab_cwd tab_state   # keyed by tty: cwd; idle | claude | busy
+for pid in ${(k)comm_of}; do
+  # A tab's shell: child of a login whose parent is Ghostty.
+  login=${ppid_of[$pid]}
+  [[ ${comm_of[$login]:-} == */login && ${comm_of[${ppid_of[$login]}]:-} == */MacOS/ghostty ]] || continue
+  tty=${tty_of[$pid]}
+  cwd=$(lsof -a -p $pid -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
+  [[ -n $cwd ]] || continue
+  fg=${tpgid_of[$pid]}
+  if [[ $fg == ${pgid_of[$pid]} ]]; then state=idle
+  elif [[ ${${comm_of[$fg]:-}:t} == claude ]]; then state=claude
+  else state=busy
+  fi
+  tab_cwd[$tty]=$cwd tab_state[$tty]=$state
+done
+
+# First tab whose shell is in $1 (or below it) with state $2.
+find_tab() {
+  local tty
+  for tty in ${(k)tab_cwd}; do
+    [[ ${tab_state[$tty]} == $2 && ( ${tab_cwd[$tty]} == $1 || ${tab_cwd[$tty]} == $1/* ) ]] \
+      && { print -r -- $tty; return }
+  done
+  return 1
+}
+
+# --- Plan each session. ---
+# osascript args: per session "name dir command plan [marker]", where plan is
+# running | idle | new. For running/idle, a marker title is written to the
+# tab's tty so the AppleScript side can find which Ghostty terminal it is.
+args=()
+n=0
+missing=0
+while IFS= read -r line || [[ -n $line ]]; do
+  line=${line%%\#*}
+  words=(${(z)line})
+  (( ${#words} )) || continue
+  name=${(Q)words[1]}
+  dir=${(Q)~words[2]:-$HOME/Projects/$name}
+  extra=${(j: :)words[3,-1]}
+  [[ -d $dir ]] || { print -u2 "warning: skipping $name: no such dir $dir"; missing=1; continue }
+  dir=${dir:A}
+  q=${(q)name}
+  cmd="claude --continue --name $q $extra || claude --name $q $extra"
+  if tty=$(find_tab $dir claude); then
+    plan=running
+  elif tty=$(find_tab $dir idle); then
+    plan=idle
+    tab_state[$tty]=taken   # two sessions in one dir need two tabs
+  else
+    plan=new tty=
+  fi
+  marker=
+  if [[ $plan == idle ]]; then
+    marker=ghostty-project-$$-$((++n))
+    printf '\e]2;%s\a' $marker > /dev/$tty
+  fi
+  args+=("$name" "$dir" "$cmd" "$plan" "$marker")
+done < $file
+
+(( ${#args} )) || { print -u2 "$file: no sessions to open"; exit 1; }
+
+osascript - "${args[@]}" <<'APPLESCRIPT'
+on run argv
+  set report to {}
+  tell application "Ghostty"
+    -- New tabs go in the window that already holds the project's tabs.
+    set projWin to missing value
+    repeat with i from 1 to (count of argv) by 5
+      if item (i + 3) of argv is not "new" then
+        set d to item (i + 1) of argv
+        repeat with w in windows
+          if (count of (terminals of w whose working directory is d)) > 0 then
+            set projWin to contents of w
+            exit repeat
+          end if
+        end repeat
+      end if
+      if projWin is not missing value then exit repeat
+    end repeat
+
+    repeat with i from 1 to (count of argv) by 5
+      set sName to item i of argv
+      set sDir to item (i + 1) of argv
+      set sCmd to item (i + 2) of argv
+      set sPlan to item (i + 3) of argv
+      set sMarker to item (i + 4) of argv
+      if sPlan is "running" then
+        set end of report to sName & ": already running"
+      else if sPlan is "idle" then
+        set found to {}
+        repeat 20 times
+          set found to every terminal whose name is sMarker
+          if (count of found) > 0 then exit repeat
+          delay 0.05
+        end repeat
+        if (count of found) is 0 then error sName & ": could not find its idle tab in Ghostty"
+        set t to item 1 of found
+        input text sCmd to t
+        send key "enter" to t
+        set end of report to sName & ": started in its idle tab"
+      else
+        set cfg to new surface configuration
+        set initial working directory of cfg to sDir
+        set initial input of cfg to sCmd & linefeed
+        if projWin is missing value then
+          set projWin to new window with configuration cfg
+        else
+          new tab in projWin with configuration cfg
+        end if
+        set end of report to sName & ": opened new tab"
+      end if
+    end repeat
+    activate
+  end tell
+  set AppleScript's text item delimiters to linefeed
+  return report as text
+end run
+APPLESCRIPT
+exit $missing
