@@ -5,7 +5,8 @@
 #   ghostty-project               list projects
 #
 # Project file: one session per line, "name [dir] [extra claude args...]".
-# dir defaults to ~/Projects/<name>. Blank lines and # comments are ignored.
+# dir defaults to ~/Projects/<name>, and can be left out before args starting
+# with "-" ("name --foo"). Blank lines and # comments are ignored.
 # Sessions whose dir is missing are skipped with a warning (exit status 1).
 #
 # Safe to rerun. Each Ghostty tab is a login -> shell pair on its own tty;
@@ -74,8 +75,10 @@ while IFS= read -r line || [[ -n $line ]]; do
   words=(${(z)line})
   (( ${#words} )) || continue
   name=${(Q)words[1]}
-  dir=${(Q)~words[2]:-$HOME/Projects/$name}
-  extra=${(j: :)words[3,-1]}
+  shift words
+  dir=$HOME/Projects/$name
+  [[ ${words[1]:-} == [^-]* ]] && { dir=${(Q)~words[1]}; shift words }
+  extra=${(j: :)words}
   [[ -d $dir ]] || { print -u2 "warning: skipping $name: no such dir $dir"; missing=1; continue }
   dir=${dir:A}
   q=${(q)name}
